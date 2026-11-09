@@ -35,7 +35,7 @@ class _SyncContext:
     ):
         self.session = session
         self.index_by_key: Dict[Tuple[str, int], CrmEntityIndex] = {}
-        self.login_parents = defaultdict(dict)
+        self.login_matches = defaultdict(dict)
         self.parent_by_key: Dict[Tuple[str, int], AbstractCustomer] = {}
 
         # Загружаем совпадения пачки, а не весь индекс.
@@ -78,7 +78,8 @@ class _SyncContext:
         item.abstract_customer_id = parent.id
         item.abstract_customer = parent
         if item.login:
-            self.login_parents[(item.entity_type, item.login)][id(parent)] = parent
+            # Считаем CRM-сущности, а не группы: совпадения внутри одной группы тоже неоднозначны.
+            self.login_matches[(item.entity_type, item.login)][key] = parent
 
     def find_exact(self, entity_type: str, crm_id: int) -> Optional[AbstractCustomer]:
         """Ищет сущность по точному CRM ID."""
@@ -93,7 +94,7 @@ class _SyncContext:
         """Возвращает группу при одном совпадении логина."""
         if not login:
             return None
-        matches = self.login_parents.get((entity_type, login), {})
+        matches = self.login_matches.get((entity_type, login), {})
         if len(matches) != 1:
             return None
         return next(iter(matches.values()))
@@ -109,11 +110,8 @@ class _SyncContext:
             self.session.add(item)
             self.index_by_key[key] = item
         else:
-            previous_parent = self.parent_by_key.get(key)
-            if item.login and previous_parent is not None:
-                self.login_parents[(entity_type, item.login)].pop(
-                    id(previous_parent), None
-                )
+            if item.login:
+                self.login_matches[(entity_type, item.login)].pop(key, None)
 
         item.login = record.login
         item.name = record.name
@@ -121,7 +119,7 @@ class _SyncContext:
         item.abstract_customer = parent
         self.parent_by_key[key] = parent
         if record.login:
-            self.login_parents[(entity_type, record.login)][id(parent)] = parent
+            self.login_matches[(entity_type, record.login)][key] = parent
 
     def merge(self, target: AbstractCustomer, source: AbstractCustomer) -> None:
         """Переносит данные и ссылки в целевую группу."""
@@ -155,14 +153,14 @@ class _SyncContext:
                     self.parent_by_key[key] = target
             self.session.delete(source)
 
-        self._rebuild_login_cache()
+        self._rebuild_login_matches()
 
-    def _rebuild_login_cache(self) -> None:
-        self.login_parents.clear()
+    def _rebuild_login_matches(self) -> None:
+        self.login_matches.clear()
         for key, item in self.index_by_key.items():
             parent = self.parent_by_key.get(key)
             if parent is not None and item.login:
-                self.login_parents[(item.entity_type, item.login)][id(parent)] = parent
+                self.login_matches[(item.entity_type, item.login)][key] = parent
 
 
 def _merge_parent_data(target: AbstractCustomer, source: AbstractCustomer) -> None:
@@ -236,10 +234,23 @@ def _process_customer_batch(
     context = _SyncContext(session, records, ENTITY_CUSTOMER, ENTITY_LEAD)
 
     for record in records:
-        # Покупателей без логина пропускаем.
+        # Покупателей без логина не обновляем, но учитываем при полной очистке.
         if not record.login:
             result.customers_skipped += 1
+
+            # Пометка «удалить» важнее обычного пропуска.
+            if "удалить" in record.name.casefold():
+                continue
+
+            seen[ENTITY_CUSTOMER].add(record.crm_id)
+            parent = context.find_exact(ENTITY_CUSTOMER, record.crm_id)
+
+            if parent is not None:
+                _mark_parent_entity(parent, "customer_groups", record.crm_id, seen)
+                _add_child_ids(parent, record, seen)
+
             continue
+
         # Сначала ищем по ID, затем — по логину сделки.
         parent = context.find_exact(ENTITY_CUSTOMER, record.crm_id)
         if parent is None:
